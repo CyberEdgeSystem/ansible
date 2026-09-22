@@ -98,7 +98,7 @@
 
           net0: "name=eth0,bridge={{ lxc_bridge }},ip={{ lxc_ip }},gw={{ lxc_gateway }}"
 
-          features: "nesting=1,keyctl=1"
+          features: "nesting=1"
 
           unprivileged: 1
           onboot: 1
