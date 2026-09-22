@@ -1,22 +1,24 @@
 ---
 # =============================================================
 # PROXMOX LXC + DOCKER
+# AWX -> Proxmox API -> LXC -> SSH -> Docker
 #
-# AWX
-#   ↓
-# Proxmox API
-#   ↓
-# LXC
-#   ↓
-# SSH через sshpass
-#   ↓
-# Docker
+# AWX Extra Variables:
+#
+# proxmox_token: "YOUR_PROXMOX_API_TOKEN"
+# lxc_vmid: 151
+# lxc_hostname: "docker-151"
+# lxc_password: "12345678"
+# lxc_ip: "172.16.12.151/24"
+# lxc_gateway: "172.16.12.254"
 #
 # IMPORTANT:
-# - SSH to Proxmox host is NOT used
-# - proxmox_ssh_password is NOT used
-# - AWX Machine Credential is NOT used for LXC SSH
-# - LXC password is taken directly from lxc_password
+# - No SSH connection to Proxmox host
+# - No sshpass
+# - No Proxmox SSH credential
+# - Proxmox is accessed ONLY through API
+# - LXC is accessed through normal Ansible SSH
+# - VLAN TAG is NOT used
 # =============================================================
 
 
@@ -51,17 +53,13 @@
         PVEAPIToken={{ proxmox_user }}!{{ proxmox_token_name }}={{ proxmox_token }}
 
     # ---------------------------------------------------------
-    # LXC TEMPLATE
+    # LXC
     # ---------------------------------------------------------
 
     lxc_template: >-
       pve-sdb:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst
 
     lxc_storage: "pve-sde"
-
-    # ---------------------------------------------------------
-    # RESOURCES
-    # ---------------------------------------------------------
 
     lxc_disk_size: 10
     lxc_cores: 2
@@ -74,6 +72,7 @@
 
     lxc_bridge: "vmbr1"
 
+    # IMPORTANT:
     # NO VLAN TAG
     lxc_net0: >-
       name=eth0,bridge={{ lxc_bridge }},ip={{ lxc_ip }},gw={{ lxc_gateway }}
@@ -283,27 +282,34 @@
 
         body:
 
+          # Identity
           vmid: "{{ lxc_vmid }}"
           hostname: "{{ lxc_hostname }}"
 
+          # OS
           ostemplate: "{{ lxc_template }}"
           ostype: "ubuntu"
 
+          # Storage
           storage: "{{ lxc_storage }}"
           rootfs: "{{ lxc_storage }}:{{ lxc_disk_size }}"
 
+          # Resources
           cores: "{{ lxc_cores }}"
           memory: "{{ lxc_memory }}"
           swap: "{{ lxc_swap }}"
 
+          # Root password
           password: "{{ lxc_password }}"
 
+          # LXC
           unprivileged: 1
           features: "nesting=1"
 
-          # NO VLAN TAG
+          # Network
           net0: "{{ lxc_net0 }}"
 
+          # Startup
           start: 0
           onboot: 1
 
@@ -347,10 +353,33 @@
       delay: 2
 
     # =========================================================
-    # 12. WAIT FOR SSH PORT
+    # 12. ADD LXC TO TEMPORARY INVENTORY
     # =========================================================
 
-    - name: Wait for LXC SSH port
+    - name: Add LXC to temporary inventory
+      ansible.builtin.add_host:
+        name: "lxc-{{ lxc_vmid }}"
+        groups:
+          - docker_lxc
+
+        ansible_host: "{{ lxc_ip | regex_replace('/.*$', '') }}"
+        ansible_user: "root"
+        ansible_password: "{{ lxc_password }}"
+        ansible_connection: "ssh"
+
+        ansible_python_interpreter: "/usr/bin/python3"
+
+        ansible_ssh_common_args: >-
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+          -o PreferredAuthentications=password
+          -o PubkeyAuthentication=no
+
+    # =========================================================
+    # 13. WAIT FOR SSH
+    # =========================================================
+
+    - name: Wait for LXC SSH
       ansible.builtin.wait_for:
         host: "{{ lxc_ip | regex_replace('/.*$', '') }}"
         port: 22
@@ -359,7 +388,7 @@
         state: started
 
     # =========================================================
-    # 13. SHOW RESULT
+    # 14. SHOW RESULT
     # =========================================================
 
     - name: Show created LXC
@@ -371,276 +400,149 @@
           - "VMID:     {{ lxc_vmid }}"
           - "Hostname: {{ lxc_hostname }}"
           - "IP:       {{ lxc_ip }}"
-          - "SSH:      OK"
           - "Status:   RUNNING"
           - "=========================================="
 
 
 # =============================================================
 # PLAY 2
-# INSTALL DOCKER THROUGH SSH FROM AWX
-#
-# IMPORTANT:
-# This play uses sshpass directly.
-# Therefore an AWX Machine Credential cannot override
-# the LXC password.
+# INSTALL DOCKER
 # =============================================================
 
 - name: Install Docker inside LXC
-  hosts: localhost
-  connection: local
-  gather_facts: false
+  hosts: docker_lxc
+  gather_facts: true
+  become: true
 
   tasks:
 
     # =========================================================
-    # 14. CHECK SSHPASS
+    # 15. VERIFY SSH
     # =========================================================
 
-    - name: Check sshpass
+    - name: Verify SSH connection
       ansible.builtin.command:
-        cmd: which sshpass
-      register: sshpass_check
+        cmd: whoami
+      register: current_user
       changed_when: false
-      failed_when: sshpass_check.rc != 0
 
-    # =========================================================
-    # 15. CHECK SSH LOGIN
-    # =========================================================
-
-    - name: Test SSH login to LXC
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          -o ConnectTimeout=10
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'echo SSH_OK'
-      register: ssh_test
-      changed_when: false
-      no_log: true
-
-    # =========================================================
-    # 16. SHOW SSH RESULT
-    # =========================================================
-
-    - name: Show SSH result
+    - name: Show connected user
       ansible.builtin.debug:
-        msg: "SSH connection to LXC is working."
+        var: current_user.stdout
 
     # =========================================================
-    # 17. UPDATE APT
+    # 16. UPDATE APT
     # =========================================================
 
     - name: Update apt cache
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'apt-get update'
-      register: apt_update
-      changed_when: false
-      no_log: true
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
 
     # =========================================================
-    # 18. INSTALL PREREQUISITES
+    # 17. DOCKER PREREQUISITES
     # =========================================================
 
     - name: Install Docker prerequisites
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg lsb-release'
-      register: docker_prerequisites
-      changed_when: true
-      no_log: true
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
 
     # =========================================================
-    # 19. CREATE KEYRING DIRECTORY
+    # 18. DOCKER KEYRING
     # =========================================================
 
     - name: Create Docker keyring directory
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'install -d -m 0755 /etc/apt/keyrings'
-      changed_when: true
-      no_log: true
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
 
     # =========================================================
-    # 20. DOWNLOAD DOCKER GPG KEY
-    # =========================================================
-
-    - name: Install Docker GPG key
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && chmod 0644 /etc/apt/keyrings/docker.asc'
-      changed_when: true
-      no_log: true
-
-    # =========================================================
-    # 21. ADD DOCKER REPOSITORY
+    # 19. DOCKER REPOSITORY
     # =========================================================
 
     - name: Add Docker repository
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'bash -c "echo \"deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ lxc_codename | default('jammy') }} stable\" > /etc/apt/sources.list.d/docker.list"'
-      changed_when: true
-      no_log: true
-
-    # =========================================================
-    # 22. UPDATE APT AFTER DOCKER REPOSITORY
-    # =========================================================
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }}
+          stable
+        filename: docker
+        state: present
 
     - name: Update apt cache after Docker repository
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'apt-get update'
-      changed_when: false
-      no_log: true
+      ansible.builtin.apt:
+        update_cache: true
 
     # =========================================================
-    # 23. INSTALL DOCKER
+    # 20. INSTALL DOCKER
     # =========================================================
 
     - name: Install Docker Engine
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
-      register: docker_install
-      changed_when: true
-      no_log: true
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
 
     # =========================================================
-    # 24. ENABLE DOCKER
+    # 21. START DOCKER
     # =========================================================
 
-    - name: Enable and start Docker
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'systemctl enable --now docker'
-      changed_when: true
-      no_log: true
+    - name: Enable Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
 
     # =========================================================
-    # 25. CHECK DOCKER VERSION
+    # 22. VERIFY DOCKER
     # =========================================================
 
     - name: Check Docker version
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'docker --version'
+      ansible.builtin.command:
+        cmd: docker --version
       register: docker_version
       changed_when: false
-      no_log: true
-
-    # =========================================================
-    # 26. CHECK DOCKER COMPOSE
-    # =========================================================
 
     - name: Check Docker Compose
-      ansible.builtin.shell:
-        cmd: >
-          SSHPASS='{{ lxc_password }}'
-          sshpass -e
-          ssh
-          -o StrictHostKeyChecking=no
-          -o UserKnownHostsFile=/dev/null
-          -o PreferredAuthentications=password
-          -o PubkeyAuthentication=no
-          root@{{ lxc_ip | regex_replace('/.*$', '') }}
-          'docker compose version'
+      ansible.builtin.command:
+        cmd: docker compose version
       register: docker_compose_version
       changed_when: false
-      no_log: true
 
     # =========================================================
-    # 27. FINAL RESULT
+    # 23. FINAL RESULT
     # =========================================================
 
-    - name: Show final result
+    - name: Final result
       ansible.builtin.debug:
         msg:
           - "=========================================="
           - "DOCKER LXC READY"
           - "=========================================="
-          - "VMID:     {{ lxc_vmid }}"
-          - "Hostname: {{ lxc_hostname }}"
-          - "IP:       {{ lxc_ip }}"
+          - "VMID:     {{ hostvars['localhost']['lxc_vmid'] }}"
+          - "Hostname: {{ hostvars['localhost']['lxc_hostname'] }}"
+          - "IP:       {{ ansible_host }}"
           - "Docker:   {{ docker_version.stdout }}"
           - "Compose:  {{ docker_compose_version.stdout }}"
           - "=========================================="
