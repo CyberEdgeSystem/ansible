@@ -63,6 +63,7 @@
         status_code:
           - 200
           - 404
+          - 500
         return_content: true
       register: existing_lxc
 
