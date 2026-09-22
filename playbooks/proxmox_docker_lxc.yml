@@ -2,7 +2,20 @@
 # =============================================================
 # PROXMOX LXC + DOCKER
 # AWX -> Proxmox API -> LXC -> SSH -> Docker
+#
+# AWX Extra Variables:
+#
+# proxmox_token: "YOUR_PROXMOX_API_TOKEN"
+# lxc_vmid: 151
+# lxc_hostname: "docker-151"
+# lxc_password: "12345678"
+# lxc_ip: "172.16.12.151/24"
+# lxc_gateway: "172.16.12.254"
+#
+# No proxmox_ssh_password required.
+# No SSH connection to Proxmox host required.
 # =============================================================
+
 
 # =============================================================
 # PLAY 1
@@ -15,6 +28,7 @@
   gather_facts: false
 
   vars:
+
     # ---------------------------------------------------------
     # PROXMOX API
     # ---------------------------------------------------------
@@ -53,8 +67,8 @@
 
     lxc_bridge: "vmbr1"
 
-    # ВАЖЛИВО:
-    # VLAN TAG НЕ використовуємо.
+    # IMPORTANT:
+    # VLAN TAG IS NOT USED.
     lxc_net0: >-
       name=eth0,bridge={{ lxc_bridge }},ip={{ lxc_ip }},gw={{ lxc_gateway }}
 
@@ -343,15 +357,12 @@
         groups:
           - docker_lxc
 
-        ansible_host: >-
-          {{ lxc_ip | regex_replace('/.*$', '') }}
-
-        ansible_user: root
+        ansible_host: "{{ lxc_ip | regex_replace('/.*$', '') }}"
+        ansible_user: "root"
         ansible_password: "{{ lxc_password }}"
+        ansible_connection: "ssh"
 
-        ansible_connection: ssh
-
-        ansible_python_interpreter: /usr/bin/python3
+        ansible_python_interpreter: "/usr/bin/python3"
 
         ansible_ssh_common_args: >-
           -o StrictHostKeyChecking=no
@@ -395,6 +406,20 @@
   hosts: docker_lxc
   gather_facts: true
   become: true
+
+  vars:
+
+    # Explicitly take credentials from localhost variables.
+    # This avoids AWX/Ansible credential inheritance problems.
+
+    ansible_user: "root"
+    ansible_password: "{{ hostvars['localhost']['lxc_password'] }}"
+    ansible_connection: "ssh"
+    ansible_python_interpreter: "/usr/bin/python3"
+
+    ansible_ssh_common_args: >-
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
 
   tasks:
 
