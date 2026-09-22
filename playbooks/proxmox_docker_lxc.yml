@@ -1,11 +1,10 @@
 ---
-- name: Deploy Docker LXC on Proxmox
+- name: Create Docker LXC on Proxmox
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
-
     # =========================================================
     # PROXMOX
     # =========================================================
@@ -19,24 +18,15 @@
 
     lxc_vmid: 151
     lxc_hostname: "docker-151"
-
-    # Template storage
     lxc_template: "pve-sdb:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst"
 
-    # LXC root password
     lxc_password: "ChangeMe123!"
 
-    # Resources
     lxc_cores: 2
     lxc_memory: 2048
     lxc_swap: 512
     lxc_disk: 10
 
-    # =========================================================
-    # STORAGE
-    # =========================================================
-
-    # LXC disk will be created here
     lxc_storage: "pve-sde"
 
     # =========================================================
@@ -45,12 +35,13 @@
 
     lxc_bridge: "vmbr1"
     lxc_ip: "172.16.12.151/24"
+    lxc_ip_plain: "172.16.12.151"
     lxc_gateway: "172.16.12.254"
 
   tasks:
 
     # =========================================================
-    # 1. CHECK IF VMID ALREADY EXISTS
+    # 1. CHECK VMID
     # =========================================================
 
     - name: Check existing LXC
@@ -69,7 +60,7 @@
 
     - name: Stop if LXC already exists
       ansible.builtin.fail:
-        msg: "LXC with VMID {{ lxc_vmid }} already exists on {{ proxmox_node }}"
+        msg: "LXC {{ lxc_vmid }} already exists on {{ proxmox_node }}"
       when: existing_lxc.status == 200
 
     # =========================================================
@@ -99,7 +90,6 @@
           net0: "name=eth0,bridge={{ lxc_bridge }},ip={{ lxc_ip }},gw={{ lxc_gateway }}"
 
           features: "nesting=1"
-
           unprivileged: 1
           onboot: 1
           start: 0
@@ -107,7 +97,6 @@
         status_code:
           - 200
         return_content: true
-
       register: lxc_create
 
     - name: Show LXC creation UPID
@@ -115,7 +104,7 @@
         var: lxc_create.json
 
     # =========================================================
-    # 3. WAIT FOR CREATE TASK
+    # 3. WAIT CREATE
     # =========================================================
 
     - name: Wait for LXC creation task
@@ -127,8 +116,7 @@
           Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
         return_content: true
       register: create_task
-      until:
-        - create_task.json.data.status == "stopped"
+      until: create_task.json.data.status == "stopped"
       retries: 60
       delay: 2
 
@@ -160,7 +148,7 @@
         var: lxc_start.json
 
     # =========================================================
-    # 5. WAIT FOR START TASK
+    # 5. WAIT START
     # =========================================================
 
     - name: Wait for LXC start task
@@ -172,8 +160,7 @@
           Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
         return_content: true
       register: start_task
-      until:
-        - start_task.json.data.status == "stopped"
+      until: start_task.json.data.status == "stopped"
       retries: 60
       delay: 2
 
@@ -185,198 +172,173 @@
         - start_task.json.data.exitstatus != "OK"
 
     # =========================================================
-    # 6. WAIT FOR SYSTEMD
+    # 6. WAIT FOR SSH
     # =========================================================
 
-    - name: Wait for LXC system
-      ansible.builtin.pause:
-        seconds: 10
+    - name: Wait for SSH port
+      ansible.builtin.wait_for:
+        host: "{{ lxc_ip_plain }}"
+        port: 22
+        state: started
+        timeout: 120
+        delay: 5
+      delegate_to: localhost
 
     # =========================================================
-    # 7. APT UPDATE
+    # 7. ADD LXC TO ANSIBLE INVENTORY
     # =========================================================
 
-    - name: Run apt update
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/exec"
-        method: POST
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        body_format: form-urlencoded
-        body:
-          command: "apt-get update"
-        status_code:
-          - 200
-        return_content: true
-      register: apt_update
-
-    - name: Wait for apt update
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/tasks/{{ apt_update.json.data }}/status"
-        method: GET
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        return_content: true
-      register: apt_task
-      until:
-        - apt_task.json.data.status == "stopped"
-      retries: 120
-      delay: 2
-
-    - name: Check apt update result
-      ansible.builtin.fail:
-        msg: "apt update failed: {{ apt_task.json.data | default(apt_task.json) }}"
-      when:
-        - apt_task.json.data.exitstatus is defined
-        - apt_task.json.data.exitstatus != "OK"
+    - name: Add LXC to temporary inventory
+      ansible.builtin.add_host:
+        name: "lxc-{{ lxc_vmid }}"
+        groups:
+          - docker_lxc
+        ansible_host: "{{ lxc_ip_plain }}"
+        ansible_user: root
+        ansible_password: "{{ lxc_password }}"
+        ansible_connection: ssh
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
 
     # =========================================================
-    # 8. INSTALL DOCKER
+    # 8. DEPLOYMENT INFORMATION
     # =========================================================
 
-    - name: Install Docker
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/exec"
-        method: POST
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        body_format: form-urlencoded
-        body:
-          command: >-
-            bash -c '
-            export DEBIAN_FRONTEND=noninteractive &&
-            apt-get install -y ca-certificates curl gnupg &&
-            install -m 0755 -d /etc/apt/keyrings &&
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg
-            -o /etc/apt/keyrings/docker.asc &&
-            chmod a+r /etc/apt/keyrings/docker.asc &&
-            echo
-            "deb [arch=$(dpkg --print-architecture)
-            signed-by=/etc/apt/keyrings/docker.asc]
-            https://download.docker.com/linux/ubuntu
-            $(. /etc/os-release && echo $VERSION_CODENAME) stable"
-            > /etc/apt/sources.list.d/docker.list &&
-            apt-get update &&
-            apt-get install -y
-            docker-ce
-            docker-ce-cli
-            containerd.io
-            docker-buildx-plugin
-            docker-compose-plugin &&
-            systemctl enable docker &&
-            systemctl start docker
-            '
-        status_code:
-          - 200
-        return_content: true
-      register: docker_install
+    - name: Show LXC information
+      ansible.builtin.debug:
+        msg:
+          - "LXC created successfully"
+          - "VMID: {{ lxc_vmid }}"
+          - "Hostname: {{ lxc_hostname }}"
+          - "IP: {{ lxc_ip_plain }}"
+          - "SSH: {{ lxc_ip_plain }}:22"
 
-    - name: Wait for Docker installation
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/tasks/{{ docker_install.json.data }}/status"
-        method: GET
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        return_content: true
-      register: docker_task
-      until:
-        - docker_task.json.data.status == "stopped"
-      retries: 180
-      delay: 2
 
-    - name: Check Docker installation result
-      ansible.builtin.fail:
-        msg: "Docker installation failed: {{ docker_task.json.data | default(docker_task.json) }}"
-      when:
-        - docker_task.json.data.exitstatus is defined
-        - docker_task.json.data.exitstatus != "OK"
+# =============================================================
+# SECOND PLAY
+# =============================================================
+
+- name: Configure Docker inside LXC
+  hosts: docker_lxc
+  gather_facts: true
+
+  become: false
+
+  tasks:
 
     # =========================================================
-    # 9. CHECK DOCKER VERSION
+    # 9. TEST SSH
+    # =========================================================
+
+    - name: Test SSH connection
+      ansible.builtin.ping:
+
+    # =========================================================
+    # 10. APT UPDATE
+    # =========================================================
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    # =========================================================
+    # 11. INSTALL PREREQUISITES
+    # =========================================================
+
+    - name: Install Docker prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+
+    # =========================================================
+    # 12. DOCKER KEYRING
+    # =========================================================
+
+    - name: Create Docker keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    # =========================================================
+    # 13. DOCKER REPOSITORY
+    # =========================================================
+
+    - name: Add Docker repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+
+    # =========================================================
+    # 14. INSTALL DOCKER
+    # =========================================================
+
+    - name: Install Docker Engine
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    # =========================================================
+    # 15. ENABLE DOCKER
+    # =========================================================
+
+    - name: Enable Docker service
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    # =========================================================
+    # 16. CHECK DOCKER
     # =========================================================
 
     - name: Check Docker version
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/exec"
-        method: POST
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        body_format: form-urlencoded
-        body:
-          command: "docker --version"
-        status_code:
-          - 200
-        return_content: true
+      ansible.builtin.command:
+        cmd: docker --version
       register: docker_version
+      changed_when: false
 
-    - name: Wait for Docker version command
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/tasks/{{ docker_version.json.data }}/status"
-        method: GET
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        return_content: true
-      register: docker_version_task
-      until:
-        - docker_version_task.json.data.status == "stopped"
-      retries: 30
-      delay: 2
-
-    - name: Check Docker version command result
-      ansible.builtin.fail:
-        msg: "Docker version command failed: {{ docker_version_task.json.data | default(docker_version_task.json) }}"
-      when:
-        - docker_version_task.json.data.exitstatus is defined
-        - docker_version_task.json.data.exitstatus != "OK"
+    - name: Show Docker version
+      ansible.builtin.debug:
+        var: docker_version.stdout
 
     # =========================================================
-    # 10. CHECK DOCKER COMPOSE
+    # 17. CHECK COMPOSE
     # =========================================================
 
-    - name: Check Docker Compose
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/exec"
-        method: POST
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        body_format: form-urlencoded
-        body:
-          command: "docker compose version"
-        status_code:
-          - 200
-        return_content: true
+    - name: Check Docker Compose version
+      ansible.builtin.command:
+        cmd: docker compose version
       register: docker_compose
+      changed_when: false
 
-    - name: Wait for Docker Compose command
-      ansible.builtin.uri:
-        url: "https://{{ proxmox_api_host }}:8006/api2/json/nodes/{{ proxmox_node }}/tasks/{{ docker_compose.json.data }}/status"
-        method: GET
-        validate_certs: false
-        headers:
-          Authorization: "PVEAPIToken=awx@pve!awx={{ proxmox_token }}"
-        return_content: true
-      register: docker_compose_task
-      until:
-        - docker_compose_task.json.data.status == "stopped"
-      retries: 30
-      delay: 2
-
-    - name: Check Docker Compose result
-      ansible.builtin.fail:
-        msg: "Docker Compose command failed: {{ docker_compose_task.json.data | default(docker_compose_task.json) }}"
-      when:
-        - docker_compose_task.json.data.exitstatus is defined
-        - docker_compose_task.json.data.exitstatus != "OK"
+    - name: Show Docker Compose version
+      ansible.builtin.debug:
+        var: docker_compose.stdout
 
     # =========================================================
-    # 11. FINAL RESULT
+    # 18. FINAL RESULT
     # =========================================================
 
     - name: Deployment summary
@@ -387,7 +349,8 @@
           - "========================================"
           - "VMID: {{ lxc_vmid }}"
           - "Hostname: {{ lxc_hostname }}"
-          - "IP: {{ lxc_ip }}"
+          - "IP: {{ lxc_ip_plain }}"
+          - "SSH: {{ lxc_ip_plain }}:22"
           - "CPU: {{ lxc_cores }}"
           - "RAM: {{ lxc_memory }} MB"
           - "Disk: {{ lxc_disk }} GB"
