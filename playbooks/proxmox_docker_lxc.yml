@@ -5,9 +5,9 @@
   gather_facts: false
 
   vars:
-    # ---------------------------------------------------------
-    # Proxmox
-    # ---------------------------------------------------------
+    # =========================================================
+    # PROXMOX
+    # =========================================================
     proxmox_host: "172.16.11.6"
     proxmox_node: "pve"
     proxmox_api_port: 8006
@@ -15,6 +15,7 @@
     proxmox_user: "awx@pve"
     proxmox_token_name: "awx"
 
+    # Передається з AWX Extra Variables
     proxmox_token: "{{ proxmox_token }}"
 
     proxmox_api_url: "https://{{ proxmox_host }}:{{ proxmox_api_port }}/api2/json"
@@ -22,48 +23,58 @@
     proxmox_auth_header:
       Authorization: "PVEAPIToken={{ proxmox_user }}!{{ proxmox_token_name }}={{ proxmox_token }}"
 
-    # ---------------------------------------------------------
+    # =========================================================
     # LXC
-    # ---------------------------------------------------------
+    # =========================================================
     lxc_vmid: 151
     lxc_hostname: "docker-151"
 
     lxc_template: "pve-sdb:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst"
-    lxc_storage: "pve-sde"
 
+    # Диск LXC
+    lxc_storage: "pve-sde"
+    lxc_disk_size: 10
+
+    # Ресурси
     lxc_cores: 2
     lxc_memory: 2048
     lxc_swap: 512
-    lxc_disk_size: 10
 
-    # ---------------------------------------------------------
-    # Network
-    # ---------------------------------------------------------
+    # =========================================================
+    # NETWORK
+    # =========================================================
     lxc_bridge: "vmbr1"
     lxc_ip: "172.16.12.151/24"
     lxc_gateway: "172.16.12.254"
 
-    # IMPORTANT:
-    # No VLAN tag here.
-    # vmbr1 already handles the required network.
+    # ВАЖЛИВО:
+    # VLAN TAG НЕ ВИКОРИСТОВУЄМО.
     lxc_net0: "name=eth0,bridge={{ lxc_bridge }},ip={{ lxc_ip }},gw={{ lxc_gateway }}"
 
-    # ---------------------------------------------------------
-    # LXC authentication
-    # ---------------------------------------------------------
-    lxc_root_password: "ChangeMe123!"
+    # =========================================================
+    # PASSWORD
+    # =========================================================
+    # Передається з AWX Extra Variables:
+    #
+    # lxc_password: "твій_пароль"
+    #
+    lxc_root_password: "{{ lxc_password }}"
 
-    # ---------------------------------------------------------
-    # Behaviour
-    # ---------------------------------------------------------
+    # =========================================================
+    # BEHAVIOUR
+    # =========================================================
+    # Якщо старий LXC 151 існує — видалити перед створенням нового.
+    #
+    # Після успішного створення НІКОЛИ НЕ ВИДАЛЯЄМО його.
     cleanup_existing: true
 
   tasks:
 
     # =========================================================
-    # 1. Check whether LXC already exists
+    # 1. CHECK EXISTING LXC
     # =========================================================
-    - name: Check existing LXC
+
+    - name: Check whether LXC exists
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/current"
         method: GET
@@ -80,28 +91,31 @@
       ansible.builtin.set_fact:
         lxc_exists: "{{ existing_lxc.status == 200 }}"
 
-    - name: Show existing LXC state
+    - name: Show existing LXC information
       ansible.builtin.debug:
         msg:
-          - "LXC {{ lxc_vmid }} exists: {{ lxc_exists }}"
-          - "Status: {{ existing_lxc.status }}"
+          - "LXC VMID: {{ lxc_vmid }}"
+          - "Exists: {{ lxc_exists }}"
+          - "HTTP status: {{ existing_lxc.status }}"
 
     # =========================================================
-    # 2. Get current status if LXC exists
+    # 2. GET EXISTING LXC STATUS
     # =========================================================
-    - name: Get existing LXC status
+
+    - name: Get existing LXC state
       ansible.builtin.set_fact:
         existing_lxc_status: "{{ existing_lxc.json.data.status | default('unknown') }}"
       when: lxc_exists
 
-    - name: Show current LXC status
+    - name: Show existing LXC state
       ansible.builtin.debug:
-        msg: "Existing LXC {{ lxc_vmid }} status: {{ existing_lxc_status }}"
+        msg: "Existing LXC {{ lxc_vmid }} state: {{ existing_lxc_status }}"
       when: lxc_exists
 
     # =========================================================
-    # 3. Stop existing LXC
+    # 3. STOP OLD LXC
     # =========================================================
+
     - name: Stop existing LXC
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/stop"
@@ -111,13 +125,13 @@
         status_code:
           - 200
         return_content: true
-      register: stop_task
+      register: stop_lxc_task
       when:
         - lxc_exists
         - cleanup_existing
         - existing_lxc_status == "running"
 
-    - name: Wait for LXC to stop
+    - name: Wait until old LXC is stopped
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/current"
         method: GET
@@ -127,11 +141,11 @@
           - 200
           - 500
         return_content: true
-      register: lxc_stop_status
+      register: stop_check
       until:
-        - lxc_stop_status.status == 500
+        - stop_check.status == 500
           or
-          lxc_stop_status.json.data.status | default('stopped') == "stopped"
+          stop_check.json.data.status | default('stopped') == "stopped"
       retries: 30
       delay: 2
       when:
@@ -140,8 +154,9 @@
         - existing_lxc_status == "running"
 
     # =========================================================
-    # 4. Delete existing LXC
+    # 4. DELETE OLD LXC
     # =========================================================
+
     - name: Delete existing LXC
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}"
@@ -151,7 +166,14 @@
         status_code:
           - 200
         return_content: true
-      register: delete_task
+      register: delete_lxc_task
+      when:
+        - lxc_exists
+        - cleanup_existing
+
+    - name: Show delete task
+      ansible.builtin.debug:
+        var: delete_lxc_task.json
       when:
         - lxc_exists
         - cleanup_existing
@@ -175,37 +197,52 @@
         - cleanup_existing
 
     # =========================================================
-    # 5. Create new LXC
+    # 5. CREATE NEW LXC
     # =========================================================
-    - name: Create LXC
+
+    - name: Create new LXC
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc"
         method: POST
         headers: "{{ proxmox_auth_header }}"
         validate_certs: false
         body_format: form-urlencoded
+
         body:
           vmid: "{{ lxc_vmid }}"
           hostname: "{{ lxc_hostname }}"
+
+          # Ubuntu 22.04 template
           ostemplate: "{{ lxc_template }}"
 
+          # Disk
           storage: "{{ lxc_storage }}"
           rootfs: "{{ lxc_storage }}:{{ lxc_disk_size }}"
 
+          # Resources
           cores: "{{ lxc_cores }}"
           memory: "{{ lxc_memory }}"
           swap: "{{ lxc_swap }}"
 
+          # Root password
           password: "{{ lxc_root_password }}"
 
+          # Unprivileged LXC
           unprivileged: 1
 
+          # Docker inside LXC
           features: "nesting=1"
 
+          # Network
+          #
+          # NO VLAN TAG!
+          #
           net0: "{{ lxc_net0 }}"
 
+          # Do not start during creation
           start: 0
 
+          # Start automatically after Proxmox reboot
           onboot: 1
 
           ostype: "unmanaged"
@@ -215,13 +252,14 @@
         return_content: true
       register: create_lxc
 
-    - name: Show LXC creation task
+    - name: Show LXC creation result
       ansible.builtin.debug:
         var: create_lxc.json
 
     # =========================================================
-    # 6. Start LXC
+    # 6. START LXC
     # =========================================================
+
     - name: Start LXC
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/start"
@@ -233,13 +271,14 @@
         return_content: true
       register: start_lxc
 
-    - name: Show start task
+    - name: Show start result
       ansible.builtin.debug:
         var: start_lxc.json
 
     # =========================================================
-    # 7. Wait until LXC is running
+    # 7. WAIT UNTIL RUNNING
     # =========================================================
+
     - name: Wait until LXC is running
       ansible.builtin.uri:
         url: "{{ proxmox_api_url }}/nodes/{{ proxmox_node }}/lxc/{{ lxc_vmid }}/status/current"
@@ -256,8 +295,9 @@
       delay: 2
 
     # =========================================================
-    # 8. Wait for SSH port
+    # 8. WAIT FOR SSH
     # =========================================================
+
     - name: Wait for SSH port
       ansible.builtin.wait_for:
         host: "{{ lxc_ip | regex_replace('/.*$', '') }}"
@@ -267,15 +307,18 @@
         state: started
 
     # =========================================================
-    # 9. Add new LXC to temporary inventory
+    # 9. ADD LXC TO TEMPORARY INVENTORY
     # =========================================================
+
     - name: Add LXC to temporary inventory
       ansible.builtin.add_host:
         name: "lxc-{{ lxc_vmid }}"
         groups: docker_lxc
+
         ansible_host: "{{ lxc_ip | regex_replace('/.*$', '') }}"
         ansible_user: root
         ansible_password: "{{ lxc_root_password }}"
+
         ansible_connection: ssh
 
         ansible_ssh_common_args: >-
@@ -283,13 +326,15 @@
           -o UserKnownHostsFile=/dev/null
 
     # =========================================================
-    # 10. Show information
+    # 10. SHOW LXC INFORMATION
     # =========================================================
+
     - name: Show LXC information
       ansible.builtin.debug:
         msg:
           - "=========================================="
           - "LXC CREATED"
+          - "=========================================="
           - "VMID:      {{ lxc_vmid }}"
           - "Hostname:  {{ lxc_hostname }}"
           - "IP:        {{ lxc_ip }}"
@@ -298,12 +343,13 @@
           - "Storage:   {{ lxc_storage }}"
           - "CPU:       {{ lxc_cores }}"
           - "RAM:       {{ lxc_memory }} MB"
+          - "Swap:      {{ lxc_swap }} MB"
           - "Disk:      {{ lxc_disk_size }} GB"
           - "=========================================="
 
 
 # =================================================================
-# CONFIGURE DOCKER INSIDE LXC
+# DOCKER CONFIGURATION
 # =================================================================
 
 - name: Configure Docker inside LXC
@@ -317,22 +363,9 @@
   tasks:
 
     # =========================================================
-    # 11. Configure root SSH
+    # 11. ENSURE SSH IS ENABLED
     # =========================================================
-    - name: Configure root SSH login
-      ansible.builtin.copy:
-        dest: /etc/ssh/sshd_config.d/99-ansible-root.conf
-        content: |
-          PermitRootLogin yes
-          PasswordAuthentication yes
-        owner: root
-        group: root
-        mode: "0600"
-      notify: Restart SSH
 
-    # =========================================================
-    # 12. Ensure SSH service is enabled
-    # =========================================================
     - name: Ensure SSH service is enabled
       ansible.builtin.systemd:
         name: ssh
@@ -340,16 +373,18 @@
         state: started
 
     # =========================================================
-    # 13. Update apt cache
+    # 12. UPDATE APT
     # =========================================================
+
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
     # =========================================================
-    # 14. Install prerequisites
+    # 13. INSTALL DOCKER PREREQUISITES
     # =========================================================
+
     - name: Install Docker prerequisites
       ansible.builtin.apt:
         name:
@@ -360,26 +395,33 @@
         state: present
 
     # =========================================================
-    # 15. Create Docker keyring directory
+    # 14. CREATE DOCKER KEYRING DIRECTORY
     # =========================================================
+
     - name: Create Docker keyring directory
       ansible.builtin.file:
         path: /etc/apt/keyrings
         state: directory
+        owner: root
+        group: root
         mode: "0755"
 
     # =========================================================
-    # 16. Download Docker GPG key
+    # 15. DOWNLOAD DOCKER GPG KEY
     # =========================================================
+
     - name: Download Docker GPG key
       ansible.builtin.get_url:
         url: https://download.docker.com/linux/ubuntu/gpg
         dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
         mode: "0644"
 
     # =========================================================
-    # 17. Add Docker repository
+    # 16. ADD DOCKER REPOSITORY
     # =========================================================
+
     - name: Add Docker repository
       ansible.builtin.apt_repository:
         repo: >-
@@ -391,15 +433,17 @@
         state: present
 
     # =========================================================
-    # 18. Update apt after repository
+    # 17. UPDATE APT
     # =========================================================
+
     - name: Update apt cache after Docker repository
       ansible.builtin.apt:
         update_cache: true
 
     # =========================================================
-    # 19. Install Docker
+    # 18. INSTALL DOCKER
     # =========================================================
+
     - name: Install Docker Engine
       ansible.builtin.apt:
         name:
@@ -411,8 +455,9 @@
         state: present
 
     # =========================================================
-    # 20. Enable Docker
+    # 19. ENABLE DOCKER
     # =========================================================
+
     - name: Enable Docker service
       ansible.builtin.systemd:
         name: docker
@@ -420,8 +465,9 @@
         state: started
 
     # =========================================================
-    # 21. Verify Docker
+    # 20. VERIFY DOCKER
     # =========================================================
+
     - name: Check Docker version
       ansible.builtin.command:
         cmd: docker --version
@@ -435,22 +481,19 @@
       changed_when: false
 
     # =========================================================
-    # 22. Final result
+    # 21. FINAL RESULT
     # =========================================================
+
     - name: Show Docker installation result
       ansible.builtin.debug:
         msg:
           - "=========================================="
           - "DOCKER LXC READY"
-          - "Hostname: {{ inventory_hostname }}"
-          - "IP: {{ ansible_host }}"
-          - "Docker: {{ docker_version.stdout }}"
-          - "Compose: {{ docker_compose_version.stdout }}"
           - "=========================================="
-
-  handlers:
-
-    - name: Restart SSH
-      ansible.builtin.systemd:
-        name: ssh
-        state: restarted
+          - "Hostname: {{ inventory_hostname }}"
+          - "IP:       {{ ansible_host }}"
+          - "Docker:   {{ docker_version.stdout }}"
+          - "Compose:  {{ docker_compose_version.stdout }}"
+          - "=========================================="
+          - "LXC {{ lxc_vmid | default('151') }} REMAINS RUNNING"
+          - "=========================================="
